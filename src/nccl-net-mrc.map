@@ -1,6 +1,11 @@
 {
   global:
     ncclNetPlugin_v12;
+    ncclMrcBootstrapListen_v1;
+    ncclMrcBootstrapListen_v2;
+    ncclMrcBootstrapListen_v3;
+    ncclMrcBootstrapListen_v4;
+    ncclMrcBootstrapCancelConnect_v3;
   local:
     *;
 };

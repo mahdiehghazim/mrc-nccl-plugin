@@ -12,6 +12,7 @@
 #include "common.h"
 #include "p2p.h"
 #include "p2p_resiliency.h"
+#include "bootstrap_handoff.h"
 
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
@@ -48,6 +49,7 @@ enum ncclIbCommState {
   ncclIbCommStatePendingReady = 8,
   ncclIbCommStateSendDevList = 9,
   ncclIbCommStateRecvDevList = 10,
+  ncclIbCommStateSendRoute = 11,
 };
 
 struct ncclIbCommStage {
@@ -65,6 +67,8 @@ struct ncclIbHandle {
   // NIC on the same subnet (for multi-subnet RoCE direct-connect topologies).
   // Zero-valued slots are ignored (validGid() returns false).
   union ibv_gid listenGids[2];
+  uint32_t bootstrapVersion;
+  struct ncclMrcBootstrapRoute bootstrapRoute;
 };
 
 NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
@@ -791,17 +795,43 @@ static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemote
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenComm) {
+static ncclResult_t ncclIbListenInternal(int dev, const union ncclSocketAddress* address, uint64_t magic,
+                                        bool exclusive, void* opaqueHandle, void** listenComm,
+                                        const char* handoffSocket = nullptr, const char* runId = nullptr, int rank = -1,
+                                        int persistentRanks = 0, const char* previousIp = nullptr,
+                                        int groupFirst = 0, int groupStride = 0) {
   ncclResult_t ret = ncclSuccess;
   struct ncclIbListenComm* comm;
   NCCLCHECK(ncclCalloc(&comm, 1));
   struct ncclIbHandle* handle = (struct ncclIbHandle*)opaqueHandle;
-  static_assert(sizeof(struct ncclIbHandle) < NCCL_NET_HANDLE_MAXSIZE, "ncclIbHandle size too large");
-  memset(handle, 0, sizeof(struct ncclIbHandle));
+  static_assert(sizeof(struct ncclIbHandle) <= NCCL_NET_HANDLE_MAXSIZE, "ncclIbHandle size too large");
+  memset(handle, 0, exclusive ? NCCL_NET_HANDLE_MAXSIZE : sizeof(struct ncclIbHandle));
   comm->dev = dev;
-  handle->magic = ncclSocketDefaultMagic();
-  NCCLCHECKGOTO(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
-  NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail);
+  handle->magic = magic;
+  NCCLCHECKGOTO(ncclSocketInit(&comm->sock, handoffSocket ? nullptr : address, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
+  if (handoffSocket) {
+    char ip[INET_ADDRSTRLEN];
+    std::string error;
+    bool valid = inet_ntop(AF_INET, &address->sin.sin_addr, ip, sizeof(ip)) != nullptr;
+    if (valid && persistentRanks)
+      valid = ncclMrcBootstrapRegister(handoffSocket, runId, rank, ip, ntohs(address->sin.sin_port),
+                                       previousIp, magic, &comm->bootstrapBroker, &error, groupFirst, groupStride, persistentRanks);
+    else if (valid)
+      valid = ncclMrcBootstrapTakeListener(handoffSocket, runId, rank, ip, ntohs(address->sin.sin_port),
+                                           &comm->sock.socketDescriptor, &error);
+    if (!valid) {
+      WARN("NET/MRC prepared bootstrap listener: %s", error.empty() ? "invalid IPv4 endpoint" : error.c_str());
+      ret = ncclSystemError;
+      goto fail;
+    }
+    comm->sock.addr = *address;
+    comm->sock.salen = sizeof(struct sockaddr_in);
+    if (!persistentRanks) NCCLCHECKGOTO(ncclOsSocketSetFlags(&comm->sock), ret, fail);
+    comm->sock.acceptSocketDescriptor = comm->sock.socketDescriptor;
+    comm->sock.state = ncclSocketStateReady;
+  } else {
+    NCCLCHECKGOTO(ncclSocketListen(&comm->sock, !exclusive), ret, fail);
+  }
   NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail);
 
   // Embed GIDs of all PFs in the handle so the connector can find a local NIC
@@ -826,8 +856,177 @@ exit:
   return ret;
 fail:
   (void)ncclSocketClose(&comm->sock);
+  if (comm->bootstrapBroker) {
+    std::string error;
+    if (!ncclMrcBootstrapUnregister(comm->bootstrapBroker, &error)) WARN("NET/MRC broker cleanup: %s", error.c_str());
+  }
   free(comm);
   goto exit;
+}
+
+ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenComm) {
+  return ncclIbListenInternal(dev, &ncclIbIfAddr, ncclSocketDefaultMagic(), false, opaqueHandle, listenComm);
+}
+
+static ncclResult_t ncclMrcBootstrapListenInternal(void* ctx, int dev, const char* interface,
+                                      const char* ownIp, uint16_t ownPort, const char* nextIp, uint16_t nextPort,
+                                      uint64_t magic, void* ownHandle, void* nextHandle, void** listenComm,
+                                      const char* handoffSocket, const char* runId, int rank,
+                                      int persistentRanks = 0, const char* previousIp = nullptr,
+                                      int groupFirst = 0, int groupStride = 0) {
+  if (listenComm) *listenComm = NULL;
+  if (!interface || !ownIp || !nextIp || !ownHandle || !nextHandle || !listenComm ||
+      !ownPort || !nextPort || !magic || dev < 0 || dev >= ncclNMergedIbDevs) {
+    WARN("NET/MRC static bootstrap: invalid listener arguments");
+    return ncclInvalidArgument;
+  }
+  if (ncclParamIbSubnetAwareRouting() != 0) {
+    WARN("NET/MRC static bootstrap requires NCCL_IB_SUBNET_AWARE_ROUTING=0");
+    return ncclInvalidUsage;
+  }
+  union ncclSocketAddress own = {};
+  struct ncclIbHandle next;
+  memset(&next, 0, sizeof(next));
+  own.sin.sin_family = next.connectAddr.sin.sin_family = AF_INET;
+  own.sin.sin_port = htons(ownPort);
+  next.connectAddr.sin.sin_port = htons(nextPort);
+  next.magic = magic;
+  if (inet_pton(AF_INET, ownIp, &own.sin.sin_addr) != 1 ||
+      inet_pton(AF_INET, nextIp, &next.connectAddr.sin.sin_addr) != 1) {
+    WARN("NET/MRC static bootstrap: invalid IPv4 endpoint");
+    return ncclInvalidArgument;
+  }
+  if (strcmp(interface, ncclIbIfName) != 0 || ncclIbIfAddr.sa.sa_family != AF_INET ||
+      own.sin.sin_addr.s_addr != ncclIbIfAddr.sin.sin_addr.s_addr) {
+    WARN("NET/MRC static bootstrap: manifest interface/IP differs from the selected local interface");
+    return ncclInvalidUsage;
+  }
+  if (own.sin.sin_addr.s_addr == next.connectAddr.sin.sin_addr.s_addr && ownPort == nextPort &&
+      !(groupStride && persistentRanks == 1)) {
+    WARN("NET/MRC static bootstrap: own and next endpoints must differ");
+    return ncclInvalidArgument;
+  }
+  if (persistentRanks) {
+    std::string error;
+    int source = groupStride ? groupFirst + groupStride * rank : rank;
+    int destination = (rank + 1) % persistentRanks;
+    if (groupStride) destination = groupFirst + groupStride * destination;
+    if (!ncclMrcBootstrapMakeRoute(runId, source, destination, &next.bootstrapRoute, &error)) {
+      WARN("NET/MRC persistent route: %s", error.c_str());
+      return ncclInvalidArgument;
+    }
+    next.bootstrapVersion = groupStride ? 4 : 3;
+  }
+  NCCLCHECK(ncclIbListenInternal(dev, &own, magic, true, ownHandle, listenComm, handoffSocket, runId,
+                                groupStride ? groupFirst + groupStride * rank : rank,
+                                persistentRanks, previousIp, groupFirst, groupStride));
+  memset(nextHandle, 0, NCCL_NET_HANDLE_MAXSIZE);
+  memcpy(nextHandle, &next, sizeof(next));
+  INFO(NCCL_NET, "NET/MRC static bootstrap: exclusive listener %s:%u, next %s:%u, magic 0x%016lx",
+       ownIp, ownPort, nextIp, nextPort, magic);
+  if (handoffSocket) INFO(NCCL_NET, "NET/MRC %s bootstrap: %s for run %s rank %d from %s",
+                         persistentRanks ? "persistent" : "prepared", persistentRanks ? "registered" : "adopted listener",
+                         runId, rank, handoffSocket);
+  return ncclSuccess;
+}
+
+extern "C" __attribute__((visibility("default")))
+ncclResult_t ncclMrcBootstrapListen_v1(void* ctx, int dev, const char* interface,
+                                      const char* ownIp, uint16_t ownPort, const char* nextIp, uint16_t nextPort,
+                                      uint64_t magic, void* ownHandle, void* nextHandle, void** listenComm) {
+  return ncclMrcBootstrapListenInternal(ctx, dev, interface, ownIp, ownPort, nextIp, nextPort,
+                                       magic, ownHandle, nextHandle, listenComm, nullptr, nullptr, -1);
+}
+
+extern "C" __attribute__((visibility("default")))
+ncclResult_t ncclMrcBootstrapListen_v2(void* ctx, int dev, const char* interface,
+                                      const char* ownIp, uint16_t ownPort, const char* nextIp, uint16_t nextPort,
+                                      uint64_t magic, void* ownHandle, void* nextHandle, void** listenComm,
+                                      const char* handoffSocket, const char* runId, int rank) {
+  if (!handoffSocket || !runId || rank < 0 || rank >= 65536) {
+    WARN("NET/MRC prepared bootstrap requires a handoff endpoint, run ID and valid rank");
+    if (listenComm) *listenComm = nullptr;
+    return ncclInvalidArgument;
+  }
+  return ncclMrcBootstrapListenInternal(ctx, dev, interface, ownIp, ownPort, nextIp, nextPort,
+                                       magic, ownHandle, nextHandle, listenComm, handoffSocket, runId, rank);
+}
+
+extern "C" __attribute__((visibility("default")))
+ncclResult_t ncclMrcBootstrapListen_v3(void* ctx, int dev, const char* interface,
+                                      const char* ownIp, uint16_t ownPort, const char* nextIp, uint16_t nextPort,
+                                      uint64_t magic, void* ownHandle, void* nextHandle, void** listenComm,
+                                      const char* handoffSocket, const char* runId, int rank,
+                                      int nranks, const char* previousIp) {
+  if (!handoffSocket || !runId || !previousIp || nranks <= 0 || nranks > 65536 || nranks % 4 ||
+      rank < 0 || rank >= nranks) {
+    WARN("NET/MRC persistent bootstrap requires a helper, job ID and identical four-GPU rank mapping");
+    if (listenComm) *listenComm = nullptr;
+    return ncclInvalidArgument;
+  }
+  return ncclMrcBootstrapListenInternal(ctx, dev, interface, ownIp, ownPort, nextIp, nextPort,
+                                       magic, ownHandle, nextHandle, listenComm, handoffSocket, runId, rank,
+                                       nranks, previousIp);
+}
+
+extern "C" __attribute__((visibility("default")))
+ncclResult_t ncclMrcBootstrapListen_v4(void* ctx, int dev, const char* interface,
+                                       const char* ownIp, uint16_t ownPort, const char* nextIp, uint16_t nextPort,
+                                       uint64_t magic, void* ownHandle, void* nextHandle, void** listenComm,
+                                       const char* handoffSocket, const char* runId, int rank,
+                                       int nranks, const char* previousIp, int first, int stride) {
+  if (!handoffSocket || !runId || !previousIp || nranks <= 0 || nranks > 65536 || first < 0 ||
+      stride <= 0 || stride > 65536 || rank < 0 || rank >= nranks ||
+      static_cast<int64_t>(first) + static_cast<int64_t>(stride) * (nranks - 1) >= 65536) {
+    WARN("NET/MRC invalid strided bootstrap group");
+    if (listenComm) *listenComm = nullptr;
+    return ncclInvalidArgument;
+  }
+  NCCLCHECK(ncclMrcBootstrapListenInternal(ctx, dev, interface, ownIp, ownPort, nextIp, nextPort,
+                                          magic, ownHandle, nextHandle, listenComm, handoffSocket, runId, rank,
+                                          nranks, previousIp, first, stride));
+  INFO(NCCL_NET, "NET/MRC strided bootstrap: rank %d/%d endpoint %d next %d first %d stride %d",
+       rank, nranks, first + stride * rank, first + stride * ((rank + 1) % nranks), first, stride);
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclMrcBootstrapSendRoute(struct ncclIbHandle* handle, struct ncclSocket* socket, int* offset) {
+  if (handle->bootstrapVersion == 0) return ncclSuccess;
+  if (handle->bootstrapVersion != 3 && handle->bootstrapVersion != 4) {
+    WARN("NET/MRC unsupported bootstrap routing version %u", handle->bootstrapVersion);
+    return ncclInvalidUsage;
+  }
+  char header[28];
+  ncclMrcBootstrapEncodeRoute(handle->bootstrapRoute, header, handle->bootstrapVersion == 4);
+  return ncclSocketProgress(NCCL_SOCKET_SEND, socket, header, sizeof(header), offset);
+}
+
+static ncclResult_t ncclMrcBootstrapAcceptSocket(struct ncclIbListenComm* listener, struct ncclSocket* socket, int* ready) {
+  *ready = 0;
+  if (socket->state == ncclSocketStateReady) { *ready = 1; return ncclSuccess; }
+  std::string error;
+  int fd = -1;
+  if (!ncclMrcBootstrapPoll(listener->bootstrapBroker, &fd, &error)) {
+    WARN("NET/MRC connected bootstrap handoff: %s", error.c_str());
+    return ncclSystemError;
+  }
+  if (fd < 0) return ncclSuccess;
+  socket->socketDescriptor = fd;
+  socket->salen = sizeof(socket->addr.sin);
+  socklen_t length = sizeof(socket->addr);
+  if (getpeername(fd, &socket->addr.sa, &length) != 0) {
+    WARN("NET/MRC connected bootstrap peer lookup: %s", strerror(errno));
+    NCCLCHECK(ncclSocketClose(socket));
+    return ncclSystemError;
+  }
+  socket->magic = listener->sock.magic;
+  socket->type = ncclSocketTypeNetIb;
+  socket->asyncFlag = 1;
+  NCCLCHECK(ncclOsSocketSetFlags(socket));
+  // The helper consumed and validated magic/type plus MRC3, not any IB metadata.
+  socket->state = ncclSocketStateReady;
+  *ready = 1;
+  return ncclSuccess;
 }
 
 #define NCCL_IB_SL_DEFAULT 0
@@ -1012,6 +1211,7 @@ ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** se
   *sendComm = NULL;
 
   if (stage->state == ncclIbCommStateConnect) goto ib_connect_check;
+  if (stage->state == ncclIbCommStateSendRoute) goto ib_send_route;
   if (stage->state == ncclIbCommStateSendDevList) goto ib_send_dev_list;
   if (stage->state == ncclIbCommStateRecvDevList) goto ib_recv_dev_list;
   if (stage->state == ncclIbCommStateSend) goto ib_send;
@@ -1024,6 +1224,7 @@ ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** se
   stage->buffer = NULL;
 
   NCCLCHECK(ncclIbMalloc((void**)&comm, sizeof(struct ncclIbSendComm)));
+  comm->base.sock.socketDescriptor = NCCL_INVALID_SOCKET;
   NCCLCHECKGOTO(ncclIbSendCommInit(comm), ret, fail);
   NCCLCHECKGOTO(ncclIbStatsInit(&comm->base.stats), ret, fail);
   NCCLCHECKGOTO(ncclSocketInit(&comm->base.sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1),
@@ -1036,6 +1237,12 @@ ib_connect_check:
   /* since ncclSocketConnect is async, we must check if connection is complete */
   NCCLCHECKGOTO(ncclSocketReady(&comm->base.sock, &ready), ret, fail);
   if (!ready) return ncclSuccess;
+
+  stage->state = ncclIbCommStateSendRoute;
+  stage->offset = 0;
+ib_send_route:
+  NCCLCHECKGOTO(ncclMrcBootstrapSendRoute(handle, &comm->base.sock, &stage->offset), ret, fail);
+  if (handle->bootstrapVersion && stage->offset != 28) return ncclSuccess;
 
   // IB Setup
   struct ncclIbMergedDev* mergedDev;
@@ -1291,11 +1498,15 @@ ib_send_ready:
   *sendComm = comm;
 exit:
   if (stage->buffer) free(stage->buffer);
+  stage->buffer = nullptr;
+  stage->comm = nullptr;
   stage->state = ncclIbCommStateStart;
   return ret;
 fail:
+  if (handle->bootstrapVersion && comm) (void)ncclSocketClose(&comm->base.sock);
   if (comm) (void)ncclIbDestroyDataQps(&comm->base);
   free(comm);
+  stage->comm = nullptr;
   goto exit;
 }
 
@@ -1614,21 +1825,26 @@ ncclResult_t ncclIbAcceptImpl(void* listenComm, void** recvComm, ncclNetDeviceHa
   }
 
   NCCLCHECK(ncclIbMalloc((void**)&rComm, sizeof(struct ncclIbRecvComm)));
+  rComm->base.sock.socketDescriptor = NCCL_INVALID_SOCKET;
   NCCLCHECKGOTO(ncclIbRecvCommInit(rComm), ret, fail);
   NCCLCHECKGOTO(ncclIbStatsInit(&rComm->base.stats), ret, fail);
   stage->comm = rComm;
   stage->state = ncclIbCommStateAccept;
   NCCLCHECKGOTO(ncclSocketInit(&rComm->base.sock), ret, fail);
-  NCCLCHECKGOTO(ncclSocketAccept(&rComm->base.sock, &lComm->sock), ret, fail);
+  if (!lComm->bootstrapBroker) NCCLCHECKGOTO(ncclSocketAccept(&rComm->base.sock, &lComm->sock), ret, fail);
 
   // Alloc stage->buffer here to be used for all following steps
   struct ncclIbConnectionMetadata remMeta;
   struct ncclIbDevExtraProps exProps;
   stage->offset = 0;
-  NCCLCHECK(ncclIbMalloc((void**)&stage->buffer, sizeof(remMeta)));
+  NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(remMeta)), ret, fail);
 
 ib_accept_check:
-  NCCLCHECKGOTO(ncclSocketReady(&rComm->base.sock, &ready), ret, fail);
+  if (lComm->bootstrapBroker) {
+    NCCLCHECKGOTO(ncclMrcBootstrapAcceptSocket(lComm, &rComm->base.sock, &ready), ret, fail);
+  } else {
+    NCCLCHECKGOTO(ncclSocketReady(&rComm->base.sock, &ready), ret, fail);
+  }
   if (!ready) return ncclSuccess;
   stage->state = ncclIbCommStateRecvDevList;
   stage->offset = 0;
@@ -1881,6 +2097,7 @@ exit:
   lComm->stage = NULL;
   return ret;
 fail:
+  if (lComm->bootstrapBroker && rComm) (void)ncclSocketClose(&rComm->base.sock);
   if (rComm) (void)ncclIbDestroyDataQps(&rComm->base);
   free(rComm);
   goto exit;
@@ -1960,11 +2177,58 @@ ncclResult_t ncclIbCloseRecv(void* recvComm) {
   return ncclSuccess;
 }
 
+extern "C" __attribute__((visibility("default")))
+ncclResult_t ncclMrcBootstrapCancelConnect_v3(void* opaqueHandle) {
+  struct ncclIbHandle* handle = static_cast<ncclIbHandle*>(opaqueHandle);
+  if (!handle || (handle->bootstrapVersion != 3 && handle->bootstrapVersion != 4)) {
+    WARN("NET/MRC invalid persistent connection cancellation");
+    return ncclInvalidArgument;
+  }
+  ncclResult_t result = ncclSuccess;
+  if (handle->stage.comm && handle->stage.state != ncclIbCommStateStart) {
+    auto* comm = static_cast<ncclIbSendComm*>(handle->stage.comm);
+    if (handle->stage.state == ncclIbCommStateConnect || handle->stage.state == ncclIbCommStateSendRoute ||
+        handle->stage.state == ncclIbCommStateSendDevList || handle->stage.state == ncclIbCommStateRecvDevList) {
+      // Device-list negotiation fills planned counts before allocating any RDMA device resources.
+      comm->base.vProps.ndevs = 0;
+      comm->base.nqps = 0;
+    }
+    result = ncclIbCloseSend(handle->stage.comm);
+  }
+  free(handle->stage.buffer);
+  memset(&handle->stage, 0, sizeof(handle->stage));
+  return result;
+}
+
 ncclResult_t ncclIbCloseListen(void* listenComm) {
   struct ncclIbListenComm* comm = (struct ncclIbListenComm*)listenComm;
+  ncclResult_t result = ncclSuccess;
   if (comm) {
-    NCCLCHECK(ncclSocketClose(&comm->sock));
+    if (comm->bootstrapBroker) {
+      std::string error;
+      if (!ncclMrcBootstrapUnregister(comm->bootstrapBroker, &error)) {
+        WARN("NET/MRC unregister bootstrap: %s", error.c_str());
+        result = ncclSystemError;
+      }
+      comm->bootstrapBroker = nullptr;
+      if (comm->stage) {
+        if (comm->stage->comm) {
+          auto* pending = static_cast<ncclIbRecvComm*>(comm->stage->comm);
+          if (comm->stage->state == ncclIbCommStateAccept || comm->stage->state == ncclIbCommStateRecvDevList ||
+              comm->stage->state == ncclIbCommStateSendDevList || comm->stage->state == ncclIbCommStateRecv) {
+            pending->base.vProps.ndevs = 0;
+            pending->base.nqps = 0;
+          }
+          ncclResult_t cleanup = ncclIbCloseRecv(comm->stage->comm);
+          if (cleanup != ncclSuccess) result = cleanup;
+        }
+        free(comm->stage->buffer);
+        free(comm->stage);
+      }
+    }
+    ncclResult_t closed = ncclSocketClose(&comm->sock);
+    if (closed != ncclSuccess) result = closed;
     free(comm);
   }
-  return ncclSuccess;
+  return result;
 }

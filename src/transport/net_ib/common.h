@@ -642,6 +642,7 @@ struct ncclIbListenComm {
   int dev;
   struct ncclSocket sock;
   struct ncclIbCommStage* stage;
+  struct ncclMrcBootstrapBroker* bootstrapBroker;
 };
 
 static inline void ncclIbCheckSpeedChanges(struct ncclIbSendComm* sendComm, struct ncclIbNetCommBase* base) {

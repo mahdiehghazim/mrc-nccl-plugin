@@ -120,7 +120,7 @@ ncclResult_t ncclSocketInit(struct ncclSocket* sock, const union ncclSocketAddre
                             uint64_t magic = ncclSocketDefaultMagic(), enum ncclSocketType type = ncclSocketTypeUnknown,
                             volatile uint32_t* abortFlag = NULL, int asyncFlag = 0, int customRetry = 0);
 // Create a listening socket. sock->addr can be pre-filled with IP & port info. sock->fd is set after a successful call
-ncclResult_t ncclSocketListen(struct ncclSocket* sock);
+ncclResult_t ncclSocketListen(struct ncclSocket* sock, bool allowReuse = true);
 ncclResult_t ncclSocketGetAddr(struct ncclSocket* sock, union ncclSocketAddress* addr);
 // Connect to sock->addr. sock->socketDescriptor is set after a successful call.
 ncclResult_t ncclSocketConnect(struct ncclSocket* sock);

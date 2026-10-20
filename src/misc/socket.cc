@@ -107,7 +107,7 @@ ncclResult_t ncclSocketSetFd(ncclSocketDescriptor socketDescriptor, struct ncclS
   return ncclSuccess;
 }
 
-ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
+ncclResult_t ncclSocketListen(struct ncclSocket* sock, bool allowReuse) {
   if (sock == NULL) {
     WARN("ncclSocketListen: pass NULL socket");
     return ncclInvalidArgument;
@@ -117,7 +117,7 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
     return ncclInvalidArgument;
   }
 
-  if (ncclSocketToPort(&sock->addr)) {
+  if (allowReuse && ncclSocketToPort(&sock->addr)) {
     // Port is forced by env. Make sure we get the port.
     int opt = 1;
 #if defined(NCCL_OS_LINUX)
