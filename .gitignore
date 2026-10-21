@@ -9,6 +9,10 @@
 build/
 libnccl-net-mrc.so
 
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
 # Editor / IDE
 .vscode/*
 !.vscode/settings.json

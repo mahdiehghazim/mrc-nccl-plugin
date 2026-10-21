@@ -47,10 +47,11 @@ are returned; there is no port sharing or fallback.
 
 Ordinary `listen()` calls retain their normal ephemeral ports and default magic.
 The extension does not remove the TCP setup used by MRC `connect()`/`accept()` to
-exchange runtime metadata. The companion NCCL patches and Python manifest/listener
-tools are not bundled in this plugin repository. The evaluation workspace's
-`static-bootstrap-tools.txt` documents the coordinated configuration and current
-limits. For schema 1, private
+exchange runtime metadata. Python manifest/listener tools and allocation/usage
+instructions are bundled under [`tools/bootstrap`](tools/bootstrap/README.md).
+The companion NCCL patches are not bundled and remain required. The evaluation
+workspace's external `static-bootstrap-tools.txt` contains the historical results
+and protocol details referenced below. For schema 1, private
 full builds and three normal/static pairs passed on two four-GPU GB200 nodes with eight-rank
 4 KiB AllReduce correctness. Static mode confirmed exclusive manifest listeners,
 but peer-listener readiness races triggered TCP retry backoff and no startup
@@ -135,7 +136,10 @@ FD4/ACK4/DONE4 handoff. The 40-byte routing prefix and 128-byte NET handle limit
 are preserved; NET v12 is unchanged. `ncclMrcBootstrapCancelConnect_v3` also
 accepts v4 handles. Schemas 1-3 remain separate and unsupported versions fail.
 
-Enable `--strided-groups` during persistent preparation. Full/subset overlap,
+The bundled `prepare_nccl_bootstrap.py` enables schema 4 automatically using four
+reserved ports per node; see its [usage guide](tools/bootstrap/README.md).
+With the compatibility generator, enable `--strided-groups` during persistent
+preparation. Full/subset overlap,
 cross-node first-rank groups, offset/singleton groups, native routing, cleanup
 and rejection paths have CPU/loopback coverage. Private full builds and six
 normal/persistent GPU jobs passed on 64 nodes on 2026-10-20, with full A256 and
