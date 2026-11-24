@@ -12,6 +12,10 @@
 #include "common.h"
 #include "p2p.h"
 #include "p2p_resiliency.h"
+#include "ib_connect_profile.h"
+#include "early_bootstrap.h"
+#include "early_mrc.h"
+#include <cstdarg>
 
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
@@ -32,6 +36,7 @@ NCCL_PARAM(MrcCcMinRate, "MRC_CC_MIN_RATE", 0);
 NCCL_PARAM(MrcCcMaxRate, "MRC_CC_MAX_RATE", 0);
 
 extern int64_t ncclParamIbOooRq();
+extern int64_t ncclParamIbResiliencyPortFailover();
 
 struct ncclIbDevExtraProps {
   bool oooRq;
@@ -76,25 +81,27 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
   ncclIbDev* ibDev = ncclIbDevs + ibDevN;
   {
     std::lock_guard<std::mutex> lock(ibDev->mutex);
-    if (0 == ibDev->pdRefs++) {
-      NCCLCHECK(wrap_ibv_alloc_pd(&ibDev->pd, ibDev->context));
+    if (ibDev->pdRefs == 0) {
+      NCCLCHECK(NIT_IB_CONNECT_CALL(AllocPd, wrap_ibv_alloc_pd(&ibDev->pd, ibDev->context)));
     }
+    ibDev->pdRefs++;
     base->pd = ibDev->pd;
   }
 
-  ncclIbGidInfoSnapshot(base, ibDev);
+  NIT_IB_CONNECT_VOID(GidSnapshot, ncclIbGidInfoSnapshot(base, ibDev));
 
-  NCCLCHECK(wrap_mrc_create_cq(&base->mrcCq, ibDev->mrcContext, cqSize, cq_context, NULL, 0));
-  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, cqSize, cq_context, NULL, 0));
+  NCCLCHECK(NIT_IB_CONNECT_CALL(CreateMrcCq, wrap_mrc_create_cq(&base->mrcCq, ibDev->mrcContext, cqSize, cq_context, NULL, 0)));
+  NCCLCHECK(NIT_IB_CONNECT_CALL(CreateIbCq, wrap_ibv_create_cq(&base->cq, ibDev->context, cqSize, cq_context, NULL, 0)));
 
-  NCCLCHECK(ncclIbGetPkeyIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &base->pkeyIndex));
+  NCCLCHECK(NIT_IB_CONNECT_CALL(PkeyLookup, ncclIbGetPkeyIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &base->pkeyIndex)));
 
   return ncclSuccess;
 }
 
 ncclResult_t ncclIbDestroyBase(struct ncclIbNetCommDevBase* base) {
-  NCCLCHECK(wrap_mrc_destroy_cq(base->mrcCq));
-  NCCLCHECK(wrap_ibv_destroy_cq(base->cq));
+  if (base->mrcCq) NCCLCHECK(wrap_mrc_destroy_cq(base->mrcCq));
+  if (base->cq) NCCLCHECK(wrap_ibv_destroy_cq(base->cq));
+  if (base->pd == nullptr) return ncclSuccess;
 
   std::lock_guard<std::mutex> lock(ncclIbDevs[base->ibDevN].mutex);
   if (0 == --ncclIbDevs[base->ibDevN].pdRefs) {
@@ -882,7 +889,7 @@ static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
       }
     }
 
-    NCCLCHECK(ncclIbQpCreate(localQp, &qpCreateAttrs));
+    NCCLCHECK(NIT_IB_CONNECT_INDEX(QpCreate, qpIndex, ncclIbQpCreate(localQp, &qpCreateAttrs)));
     INFO(NCCL_NET,
          "NET/IB: %s: QP created: port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qp_num=%u pkey=%u pd=%p oooRq=%d",
          __func__, ibDev->portNum, commDev->base.ibDevN, ncclIbDevs[commDev->base.ibDevN].devName, ncclNIbDevs,
@@ -900,13 +907,13 @@ static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
     initAttr->pkeyIndex = commDev->base.pkeyIndex;
     initAttr->portNum = ibDev->portNum;
     initAttr->qpAccessFlags = IBV_ACCESS_REMOTE_WRITE;
-    NCCLCHECK(ncclIbQpInit(localQp));
+    NCCLCHECK(NIT_IB_CONNECT_INDEX(QpInit, qpIndex, ncclIbQpInit(localQp)));
 
     if (ncclParamIbEceEnable() && localQp->qp) {
       // Query ECE (Enhanced Connection Establishment) capabilities and
       // populate the initial ECE into the metadata structure that is sent to
       // the remote (receiver) side.
-      NCCLCHECK(wrap_ibv_query_ece(localQp->qp, &localQpInfo->ece, &localQp->eceSupported));
+      NCCLCHECK(NIT_IB_CONNECT_INDEX(QueryEce, qpIndex, wrap_ibv_query_ece(localQp->qp, &localQpInfo->ece, &localQp->eceSupported)));
       localQpInfo->ece_supported = localQp->eceSupported;
     } else {
       // Declare to the remote side that ECE is not supported
@@ -949,7 +956,7 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
            __func__, commDev->base.ibDevN, ibDev->portNum, localQp->qpn, remQpInfo->ece_supported,
            remQpInfo->ece.vendor_id, remQpInfo->ece.options, remQpInfo->ece.comp_mask);
       // Set the reduced ECE received from the receiver side
-      NCCLCHECK(wrap_ibv_set_ece(localQp->qp, &remQpInfo->ece, &localQp->eceSupported));
+      NCCLCHECK(NIT_IB_CONNECT_INDEX(SetEce, qpIndex, wrap_ibv_set_ece(localQp->qp, &remQpInfo->ece, &localQp->eceSupported)));
       // Store the reduced ECE locally as well
       localQp->ece = remQpInfo->ece;
     } else {
@@ -970,11 +977,11 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
     rtrAttr->localPortFlags = ibDev->portAttr.flags;
     rtrAttr->localGid = commDev->base.gidInfo.localGid;
     rtrAttr->localGidIndex = commDev->base.gidInfo.localGidIndex;
-    NCCLCHECK(ncclIbQpRtr(localQp));
+    NCCLCHECK(NIT_IB_CONNECT_INDEX(QpRtr, qpIndex, ncclIbQpRtr(localQp)));
     struct ncclIbQpRtsAttr* rtsAttr = &localQp->rtsAttr;
     rtsAttr->timeout = ncclParamIbTimeout();
     rtsAttr->retryCnt = ncclParamIbRetryCnt();
-    NCCLCHECK(ncclIbQpRts(localQp));
+    NCCLCHECK(NIT_IB_CONNECT_INDEX(QpRts, qpIndex, ncclIbQpRts(localQp)));
   }
 
   if (comm->base.resiliency) {
@@ -994,15 +1001,20 @@ void ncclIbSetTrafficClass(void* ctx, int trafficClass) {
   if (config) config->trafficClass = trafficClass;
 }
 
-ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** sendComm,
-                               ncclNetDeviceHandle_t** /*sendDevComm*/, int nQpsPerDev, int envTrafficClass) {
+struct ncclMrcEarlySender {
+  ncclIbConnectionMetadata metadata;
+};
+
+static ncclResult_t ncclIbConnectImplProfiled(void* ctx, int dev, void* opaqueHandle, void** sendComm,
+                               int nQpsPerDev, int envTrafficClass, NitIbConnectPoll& profile,
+                               ncclMrcEarlySender* early = nullptr) {
   ncclResult_t ret = ncclSuccess;
   struct ncclIbHandle* handle = (struct ncclIbHandle*)opaqueHandle;
 
   // Subnet-aware device selection: use the listener's GIDs (embedded in the
   // handle) to find a local NIC on the same subnet as the remote peer.
   // For single-subnet or IB deployments, all GIDs are zero → dev stays unchanged.
-  if (ncclParamIbSubnetAwareRouting()) NCCLCHECK(ncclIbFindDevBySubnet(handle->listenGids, 2, dev, &dev));
+  if (ncclParamIbSubnetAwareRouting()) NCCLCHECK(NIT_IB_CONNECT_CALL(SubnetSelect, ncclIbFindDevBySubnet(handle->listenGids, 2, dev, &dev)));
 
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
@@ -1023,19 +1035,27 @@ ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** se
   }
   stage->buffer = NULL;
 
-  NCCLCHECK(ncclIbMalloc((void**)&comm, sizeof(struct ncclIbSendComm)));
-  NCCLCHECKGOTO(ncclIbSendCommInit(comm), ret, fail);
-  NCCLCHECKGOTO(ncclIbStatsInit(&comm->base.stats), ret, fail);
-  NCCLCHECKGOTO(ncclSocketInit(&comm->base.sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1),
+  NCCLCHECK(NIT_IB_CONNECT_CALL(AllocComm, ncclIbMalloc((void**)&comm, sizeof(struct ncclIbSendComm))));
+  if (early) {
+    stage->comm = comm;
+    NCCLCHECK(ncclSocketInit(&comm->base.sock));
+  }
+  NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(CommInit, ncclIbSendCommInit(comm)), ret, fail);
+  NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(StatsInit, ncclIbStatsInit(&comm->base.stats)), ret, fail);
+  if (!early) NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(SocketInit, ncclSocketInit(&comm->base.sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1)),
                 ret, fail);
   stage->comm = comm;
   stage->state = ncclIbCommStateConnect;
-  NCCLCHECKGOTO(ncclSocketConnect(&comm->base.sock), ret, fail);
+  profile.phase(NitIbPhase::SocketConnect);
+  if (!early) NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(SocketConnect, ncclSocketConnect(&comm->base.sock)), ret, fail);
 
 ib_connect_check:
+  profile.phase(NitIbPhase::SocketConnect);
   /* since ncclSocketConnect is async, we must check if connection is complete */
-  NCCLCHECKGOTO(ncclSocketReady(&comm->base.sock, &ready), ret, fail);
+  ready = 1;
+  if (!early) NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(SocketReady, ncclSocketReady(&comm->base.sock, &ready)), ret, fail);
   if (!ready) return ncclSuccess;
+  profile.phase(NitIbPhase::LocalSetup);
 
   // IB Setup
   struct ncclIbMergedDev* mergedDev;
@@ -1049,7 +1069,7 @@ ib_connect_check:
   stage->state = ncclIbCommStateSendDevList;
   stage->offset = 0;
   struct ncclIbConnectionMetadata meta;
-  NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(meta)), ret, fail);
+  NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(AllocMetadata, ncclIbMalloc((void**)&stage->buffer, sizeof(meta))), ret, fail);
   memcpy(stage->buffer, &mergedDev->vProps, sizeof(ncclNetVDeviceProps_t));
 
   struct ncclIbDevExtraProps exProps;
@@ -1064,17 +1084,23 @@ ib_connect_check:
 // In the case of mismatched nDevs, we will make sure that both sides of a logical connection have the same number
 // of RC qps
 ib_send_dev_list:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer,
-                               sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps), &stage->offset));
+  profile.phase(NitIbPhase::SendDeviceList);
+  if (early) stage->offset = sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps);
+  else NCCLCHECK(NIT_IB_CONNECT_SOCKET(SendDeviceList, stage->offset, ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer,
+                               sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps), &stage->offset)));
   if (stage->offset != (sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps))) return ncclSuccess;
 
   stage->state = ncclIbCommStateRecvDevList;
   stage->offset = 0;
 
 ib_recv_dev_list:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer,
-                               sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps), &stage->offset));
+  profile.phase(NitIbPhase::RecvDeviceList);
+  // Early bootstrap requires one physical MRC device and the same QP count at both ends.
+  if (early) stage->offset = sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps);
+  else NCCLCHECK(NIT_IB_CONNECT_SOCKET(RecvDeviceList, stage->offset, ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer,
+                               sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps), &stage->offset)));
   if (stage->offset != (sizeof(ncclNetVDeviceProps_t) + sizeof(struct ncclIbDevExtraProps))) return ncclSuccess;
+  profile.phase(NitIbPhase::LocalSetup);
   stage->offset = 0;
   ncclNetVDeviceProps_t remoteVProps;
   int trafficClass;
@@ -1106,7 +1132,7 @@ ib_recv_dev_list:
     if (comm->base.resiliency) {
       NCCLCHECKGOTO(ncclIbResiliencyDataCqSizeGet(comm->base.resiliency, i, &cqSize), ret, fail);
     }
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats, cqSize), ret, fail);
+    NCCLCHECKGOTO(NIT_IB_CONNECT_INDEX(DeviceInit, i, ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats, cqSize)), ret, fail);
     comm->ar = comm->ar && ncclIbDevs[ibDevN].ar; // ADAPTIVE_ROUTING - if all merged devs have it enabled
     if (comm->base.resiliency) {
       NCCLCHECKGOTO(ncclIbResiliencyDevInit(comm->base.resiliency, i, &ncclIbDevs[ibDevN]), ret, fail);
@@ -1117,7 +1143,7 @@ ib_recv_dev_list:
   meta.ndevs = comm->base.vProps.ndevs;
 
   // Create QPs on the sender side
-  NCCLCHECKGOTO(ncclIbSenderQpsCreate(comm, &meta), ret, fail);
+  NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(QpsCreate, ncclIbSenderQpsCreate(comm, &meta)), ret, fail);
 
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     ncclIbSendCommDev* commDev = comm->devs + i;
@@ -1130,13 +1156,13 @@ ib_recv_dev_list:
     devInfo->lid = ibDev->portAttr.lid;
 
     // Prepare GIN Put Signal scratchpad (for RDMA Atomic result)
-    NCCLCHECKGOTO(wrap_ibv_reg_mr(&commDev->putSignalScratchpadMr, commDev->base.pd, &comm->putSignalScratchpad,
-                                  sizeof(comm->putSignalScratchpad), IBV_ACCESS_LOCAL_WRITE),
+    NCCLCHECKGOTO(NIT_IB_CONNECT_INDEX(RegScratchpad, i, wrap_ibv_reg_mr(&commDev->putSignalScratchpadMr, commDev->base.pd, &comm->putSignalScratchpad,
+                                  sizeof(comm->putSignalScratchpad), IBV_ACCESS_LOCAL_WRITE)),
                   ret, fail);
 
     // Prepare my CTS FIFO
-    NCCLCHECKGOTO(wrap_ibv_reg_mr(&commDev->ctsFifoMr, commDev->base.pd, comm->ctsFifo, sizeof(comm->ctsFifo),
-                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ),
+    NCCLCHECKGOTO(NIT_IB_CONNECT_INDEX(RegCtsFifo, i, wrap_ibv_reg_mr(&commDev->ctsFifoMr, commDev->base.pd, comm->ctsFifo, sizeof(comm->ctsFifo),
+                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ)),
                   ret, fail);
     devInfo->rkey = commDev->ctsFifoMr->rkey;
 
@@ -1190,8 +1216,8 @@ ib_recv_dev_list:
   }
 
   if (ncclParamIbEventBasedLb() && ncclParamIbEventBasedLbRemote()) {
-    NCCLCHECKGOTO(wrap_ibv_reg_mr(&comm->remoteSpeedMr, comm->devs[0].base.pd, &comm->remoteSpeedBuf,
-                                  sizeof(comm->remoteSpeedBuf), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE),
+    NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(RegRemoteSpeed, wrap_ibv_reg_mr(&comm->remoteSpeedMr, comm->devs[0].base.pd, &comm->remoteSpeedBuf,
+                                  sizeof(comm->remoteSpeedBuf), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE)),
                   ret, fail);
   }
   trafficClass = ncclIbGetTrafficClass(ctx);
@@ -1212,7 +1238,12 @@ ib_recv_dev_list:
   memcpy(stage->buffer, &meta, sizeof(meta));
 
 ib_send:
-  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(meta), &stage->offset),
+  profile.phase(NitIbPhase::SendMetadata);
+  if (early) {
+    memcpy(&early->metadata, stage->buffer, sizeof(meta));
+    return ncclSuccess;
+  }
+  NCCLCHECKGOTO(NIT_IB_CONNECT_SOCKET(SendMetadata, stage->offset, ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(meta), &stage->offset)),
                 ret, fail);
   if (stage->offset != sizeof(meta)) return ncclSuccess;
 
@@ -1222,11 +1253,13 @@ ib_send:
   memset(stage->buffer, 0, sizeof(meta));
 
 ib_connect:
+  profile.phase(NitIbPhase::RecvMetadata);
   struct ncclIbConnectionMetadata remMeta;
-  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer, sizeof(ncclIbConnectionMetadata),
-                                   &stage->offset),
+  if (!early) NCCLCHECKGOTO(NIT_IB_CONNECT_SOCKET(RecvMetadata, stage->offset, ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer, sizeof(ncclIbConnectionMetadata),
+                                   &stage->offset)),
                 ret, fail);
   if (stage->offset != sizeof(remMeta)) return ncclSuccess;
+  profile.phase(NitIbPhase::RemoteSetup);
 
   memcpy(&remMeta, stage->buffer, sizeof(ncclIbConnectionMetadata));
 
@@ -1268,35 +1301,48 @@ ib_connect:
 
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     ncclIbSendCommDev* commDev = comm->devs + i;
-    NCCLCHECKGOTO(wrap_ibv_reg_mr(&commDev->cmplsRecordsMr, comm->devs[i].base.pd, &comm->remCmplsRecords.elems,
+    NCCLCHECKGOTO(NIT_IB_CONNECT_INDEX(RegCompletions, i, wrap_ibv_reg_mr(&commDev->cmplsRecordsMr, comm->devs[i].base.pd, &comm->remCmplsRecords.elems,
                                   sizeof(comm->remCmplsRecords.elems),
-                                  IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ),
+                                  IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ)),
                   ret, fail);
     comm->devs[i].sge.lkey = comm->devs[i].cmplsRecordsMr->lkey;
   }
 
-  NCCLCHECKGOTO(ncclIbSenderQpsToRts(comm, &remMeta), ret, fail);
-  ncclIbComputeDevSpeeds(&comm->base);
-  ncclIbComputeLbWeights(&comm->base);
+  NCCLCHECKGOTO(NIT_IB_CONNECT_CALL(QpsToRts, ncclIbSenderQpsToRts(comm, &remMeta)), ret, fail);
+  NIT_IB_CONNECT_VOID(DeviceSpeeds, ncclIbComputeDevSpeeds(&comm->base));
+  NIT_IB_CONNECT_VOID(LbWeights, ncclIbComputeLbWeights(&comm->base));
 
   comm->base.ready = 1;
   stage->state = ncclIbCommStateConnected;
   stage->offset = 0;
 
 ib_send_ready:
-  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, &comm->base.ready, sizeof(int), &stage->offset),
+  profile.phase(NitIbPhase::SendReady);
+  if (early) stage->offset = sizeof(int);
+  else NCCLCHECKGOTO(NIT_IB_CONNECT_SOCKET(SendReady, stage->offset, ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, &comm->base.ready, sizeof(int), &stage->offset)),
                 ret, fail);
   if (stage->offset != sizeof(int)) return ncclSuccess;
 
   *sendComm = comm;
 exit:
   if (stage->buffer) free(stage->buffer);
+  stage->buffer = nullptr;
   stage->state = ncclIbCommStateStart;
   return ret;
 fail:
-  if (comm) (void)ncclIbDestroyDataQps(&comm->base);
+  profile.phase(NitIbPhase::Cleanup);
+  if (early) return ret;
+  if (comm) (void)NIT_IB_CONNECT_CALL(CleanupQps, ncclIbDestroyDataQps(&comm->base));
   free(comm);
   goto exit;
+}
+
+ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** sendComm,
+                               ncclNetDeviceHandle_t** /*sendDevComm*/, int nQpsPerDev, int envTrafficClass) {
+  NitIbConnectPoll profile(reinterpret_cast<uintptr_t>(opaqueHandle), dev);
+  ncclResult_t ret = ncclIbConnectImplProfiled(ctx, dev, opaqueHandle, sendComm, nQpsPerDev, envTrafficClass, profile);
+  profile.finish(static_cast<int>(ret), ret == ncclSuccess && *sendComm != nullptr);
+  return ret;
 }
 
 ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendComm,
@@ -1358,7 +1404,8 @@ ncclResult_t ncclIbCheckVProps(ncclNetVDeviceProps_t* vProps1, ncclNetVDevicePro
 // QPs' information so that data structure could be delivered to the remote
 // side (sender) as part of the connection establishment process.
 static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct ncclIbConnectionMetadata* remMeta,
-                                                 struct ncclIbConnectionMetadata* meta) {
+                                                 struct ncclIbConnectionMetadata* meta,
+                                                 bool prepareOnly = false, bool reuse = false) {
   uint nqps = rComm->base.nqps;
   struct ncclIbQpCreateAttr qpCreateAttrs;
   memset(&qpCreateAttrs, 0, sizeof(struct ncclIbQpCreateAttr));
@@ -1421,6 +1468,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
         return ncclInternalError;
       }
     }
+    if (!reuse) {
     NCCLCHECK(ncclIbReceiverQpCreate(ibDev, localQp, &qpCreateAttrs));
     INFO(NCCL_NET,
          "NET/IB: %s: QP created: port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qp_num=%u pkey=%u pd=%p oooRq=%d "
@@ -1440,6 +1488,8 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
     // Remote Atomic operations are used for GIN! REMOTE_READ is required for GIN Get (RDMA READ).
     initAttr->qpAccessFlags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC | IBV_ACCESS_REMOTE_READ;
     NCCLCHECK(ncclIbQpInit(localQp));
+    }
+    if (prepareOnly) continue;
 
     if (localQp->qp && remQpInfo->ece_supported) {
       // Set the ECE received from the remote (sender) side.
@@ -1966,5 +2016,227 @@ ncclResult_t ncclIbCloseListen(void* listenComm) {
     NCCLCHECK(ncclSocketClose(&comm->sock));
     free(comm);
   }
+  return ncclSuccess;
+}
+
+namespace {
+constexpr uint64_t earlyMrcMagic = 0x4d52434541524c31ULL;
+struct EarlyMrcDescriptor {
+  uint64_t magic;
+  uint32_t version, bytes, rank, nranks, nqps, matching, prepost, inlineCts;
+  ncclIbConnectionMetadata send, recv;
+};
+struct EarlyMrcSession {
+  void* ctx;
+  int dev;
+  ncclIbHandle handle;
+  ncclMrcEarlySender sender;
+  ncclIbRecvComm* recv;
+  EarlyMrcDescriptor wire;
+  bool finishAttempted, finished, bound, senderPending;
+};
+
+ncclResult_t earlyMrcInvalid(const char* reason) {
+  WARN("NET/MRC: early TCPStore bootstrap: %s", reason);
+  return ncclInvalidUsage;
+}
+
+void earlyMrcLogger(ncclDebugLogLevel level, unsigned long, const char*, int, const char* fmt, ...) {
+  if (level != NCCL_LOG_WARN) return;
+  va_list args;
+  va_start(args, fmt);
+  fprintf(stderr, "MRC early bootstrap: ");
+  vfprintf(stderr, fmt, args);
+  fprintf(stderr, "\n");
+  va_end(args);
+}
+
+ncclResult_t earlyMrcPrepareReceiver(EarlyMrcSession* session) {
+  NCCLCHECK(ncclIbMalloc(reinterpret_cast<void**>(&session->recv), sizeof(ncclIbRecvComm)));
+  auto* comm = session->recv;
+  NCCLCHECK(ncclSocketInit(&comm->base.sock));
+  NCCLCHECK(ncclIbRecvCommInit(comm));
+  NCCLCHECK(ncclIbStatsInit(&comm->base.stats));
+  comm->base.vProps = ncclIbMergedDevs[session->dev].vProps;
+  comm->base.nqps = session->wire.nqps;
+  comm->base.nDataQps = 1;
+  auto* dev = &comm->devs[0];
+  const int ibDevN = comm->base.vProps.devs[0];
+  auto* ibDev = &ncclIbDevs[ibDevN];
+  NCCLCHECK(ncclIbInitCommDevBase(ibDevN, &dev->base, &comm->base.stats,
+                                 2 * NET_IB_MAX_REQUESTS * comm->base.nqps));
+  auto* meta = &session->wire.recv;
+  NCCLCHECK(ncclIbReceiverQpsCreateToRts(comm, &session->wire.send, meta, true));
+  NCCLCHECK(wrap_ibv_reg_mr(&dev->ctsFifoMr, dev->base.pd, &comm->remCtsFifo.elems,
+      sizeof(comm->remCtsFifo.elems),
+      IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ));
+  dev->sge.lkey = dev->ctsFifoMr->lkey;
+  NCCLCHECK(wrap_ibv_reg_mr(&dev->cmplsRecordsMr, dev->base.pd, comm->cmplsRecords,
+      sizeof(comm->cmplsRecords),
+      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ));
+  if (ncclParamIbUseInline()) comm->remCtsFifo.flags = IBV_SEND_INLINE;
+  meta->ndevs = 1;
+  meta->addr = reinterpret_cast<uint64_t>(comm->cmplsRecords);
+  meta->sl = session->wire.send.sl;
+  meta->tc = session->wire.send.tc;
+  auto* info = &meta->devs[0];
+  info->rkey = dev->cmplsRecordsMr->rkey;
+  info->lid = ibDev->portAttr.lid;
+  info->mtu = ibDev->portAttr.active_mtu;
+  info->ib_port = ibDev->portNum;
+  info->link_layer = dev->base.gidInfo.link_layer;
+  info->gid = dev->base.gidInfo.localGid;
+  info->currSpeed = COMPILER_ATOMIC_LOAD(&ibDev->currSpeed, std::memory_order_relaxed);
+  comm->lastSentSpeeds[0] = static_cast<uint16_t>(info->currSpeed / 1000);
+  snprintf(meta->devName, sizeof(meta->devName), "%s", ncclIbMergedDevs[session->dev].devName);
+  session->wire.matching = comm->base.recvMatchingScheme;
+  session->wire.prepost = comm->prepostReceiveWorkRequests;
+  session->wire.inlineCts = ncclParamIbUseInline() != 0;
+  // These endpoints only carry NCCL's registered host bootstrap buffers.
+  comm->flushEnabled = 0;
+  return ncclSuccess;
+}
+
+ncclResult_t earlyMrcValidate(const EarlyMrcSession* session, const EarlyMrcDescriptor& peer, int rank) {
+  const auto& local = session->wire;
+  if (peer.magic != earlyMrcMagic || peer.version != 1 || peer.bytes != sizeof(peer) ||
+      peer.rank != static_cast<uint32_t>(rank) || peer.nranks != local.nranks ||
+      peer.nqps != local.nqps || peer.matching != local.matching ||
+      peer.prepost != local.prepost || peer.inlineCts != local.inlineCts)
+    return earlyMrcInvalid("peer identity, ABI, or connection configuration mismatch");
+  for (const auto* meta : {&peer.send, &peer.recv}) {
+    if (meta->ndevs != 1 || !meta->addr || meta->tc != local.send.tc || meta->sl != local.send.sl ||
+        meta->devs[0].link_layer != local.send.devs[0].link_layer ||
+        meta->devs[0].mtu < IBV_MTU_256 || meta->devs[0].mtu > IBV_MTU_4096)
+      return earlyMrcInvalid("unsupported peer device or traffic-class metadata");
+    for (unsigned q = 0; q < local.nqps; ++q)
+      if (meta->qpInfo[q].devIndex != 0 || meta->qpInfo[q].ece_supported)
+        return earlyMrcInvalid("early bootstrap requires non-ECE single-device MRC QPs");
+  }
+  return ncclSuccess;
+}
+}
+
+extern "C" int ncclMrcEarlyBootstrapDescriptorSizeV1() {
+  return sizeof(EarlyMrcDescriptor);
+}
+
+extern "C" int ncclMrcEarlyBootstrapPrepareV1(const char* deviceName, int rank, int nranks,
+    int trafficClass, void** opaque, void* descriptor, int size) {
+  if (!opaque || !descriptor || size != sizeof(EarlyMrcDescriptor) || !deviceName ||
+      rank < 0 || rank >= nranks || nranks < 2)
+    return earlyMrcInvalid("invalid preparation arguments");
+  *opaque = nullptr;
+  EarlyMrcSession* session = nullptr;
+  NCCLCHECK(ncclCalloc(&session, 1));
+  *opaque = session; // The caller must close even a partially prepared session.
+  ncclNetCommConfig_t config = {};
+  config.trafficClass = trafficClass;
+  NCCLCHECK(ncclIbInit(&session->ctx, 0, &config, earlyMrcLogger, nullptr));
+  if (ncclParamIbOooRq() || ncclParamIbSubnetAwareRouting() ||
+      ncclParamIbResiliencyPortFailover() ||
+      (ncclParamIbEventBasedLb() && ncclParamIbEventBasedLbRemote()))
+    return earlyMrcInvalid("OOO, subnet override, resiliency, and remote speed updates are unsupported");
+  if (*deviceName == '=') ++deviceName;
+  session->dev = -1;
+  for (int d = 0; d < ncclNMergedIbDevs; ++d)
+    if (!strcmp(deviceName, ncclIbMergedDevs[d].devName)) session->dev = d;
+  if (session->dev < 0) return earlyMrcInvalid("NCCL_OOB_NET_IFNAME must name exactly one available MRC device");
+  auto* merged = &ncclIbMergedDevs[session->dev];
+  if (merged->vProps.ndevs != 1 || !ncclIbDevs[merged->vProps.devs[0]].mrcContext ||
+      ncclParamIbQpsPerConn() < 1 || ncclParamIbQpsPerConn() > NCCL_IB_MAX_QPS)
+    return earlyMrcInvalid("one physical MRC device and a bounded positive QP count are required");
+  session->wire.magic = earlyMrcMagic;
+  session->wire.version = 1;
+  session->wire.bytes = sizeof(session->wire);
+  session->wire.rank = rank;
+  session->wire.nranks = nranks;
+  session->wire.nqps = ncclParamIbQpsPerConn();
+  void* unused = nullptr;
+  NitIbConnectPoll profile(reinterpret_cast<uintptr_t>(&session->handle), session->dev);
+  ncclResult_t ret = ncclIbConnectImplProfiled(session->ctx, session->dev, &session->handle, &unused,
+      session->wire.nqps, ncclParamIbTc(), profile, &session->sender);
+  profile.finish(static_cast<int>(ret), false);
+  NCCLCHECK(ret);
+  session->senderPending = true;
+  session->wire.send = session->sender.metadata;
+  NCCLCHECK(earlyMrcPrepareReceiver(session));
+  memcpy(descriptor, &session->wire, sizeof(session->wire));
+  return ncclSuccess;
+}
+
+extern "C" int ncclMrcEarlyBootstrapFinishV1(void* opaque, const void* predecessor,
+    const void* successor, int size) {
+  auto* session = static_cast<EarlyMrcSession*>(opaque);
+  if (!session || session->finishAttempted || session->bound || !predecessor || !successor ||
+      size != sizeof(EarlyMrcDescriptor) || !session->recv)
+    return earlyMrcInvalid("invalid finalization state or descriptor size");
+  // Copy rather than requiring ctypes/TCPStore byte buffers to be naturally aligned.
+  EarlyMrcDescriptor prev, next;
+  memcpy(&prev, predecessor, sizeof(prev));
+  memcpy(&next, successor, sizeof(next));
+  const int rank = session->wire.rank, nranks = session->wire.nranks;
+  NCCLCHECK(earlyMrcValidate(session, prev, (rank + nranks - 1) % nranks));
+  NCCLCHECK(earlyMrcValidate(session, next, (rank + 1) % nranks));
+  session->finishAttempted = true;
+  auto* recv = session->recv;
+  recv->base.nRemDevs = 1;
+  recv->base.remDevs[0] = prev.send.devs[0];
+  recv->base.remDevs[0].remoteGid = prev.send.devs[0].gid;
+  recv->remCtsFifo.addr = prev.send.addr;
+  recv->remCtsFifo.rkeys[0] = prev.send.devs[0].rkey;
+  NCCLCHECK(ncclIbReceiverQpsCreateToRts(recv, &prev.send, &session->wire.recv, false, true));
+  if (recv->prepostReceiveWorkRequests) NCCLCHECK(ncclIbReceiverPrePostReceiveWorkRequests(recv));
+  recv->base.ready = 1;
+  auto* stage = &session->handle.stage;
+  memcpy(stage->buffer, &next.recv, sizeof(next.recv));
+  stage->offset = sizeof(next.recv);
+  stage->state = ncclIbCommStateConnecting;
+  void* send = nullptr;
+  NitIbConnectPoll profile(reinterpret_cast<uintptr_t>(&session->handle), session->dev);
+  ncclResult_t ret = ncclIbConnectImplProfiled(session->ctx, session->dev, &session->handle, &send,
+      session->wire.nqps, ncclParamIbTc(), profile, &session->sender);
+  profile.finish(static_cast<int>(ret), ret == ncclSuccess && send != nullptr);
+  if (ret != ncclSuccess || send != nullptr) session->senderPending = false;
+  NCCLCHECK(ret);
+  if (!send) return earlyMrcInvalid("sender did not complete without socket I/O");
+  session->finished = true;
+  return ncclSuccess;
+}
+
+extern "C" int ncclMrcEarlyBootstrapBindV1(void* opaque, const void* uniqueId, int size) {
+  auto* session = static_cast<EarlyMrcSession*>(opaque);
+  if (!session || !session->finished || session->bound || !uniqueId || size != 128 ||
+      memcmp(static_cast<const char*>(uniqueId) + 120, "MRCEARLY", 8))
+    return earlyMrcInvalid("binding requires finalized endpoints and an early-bootstrap unique ID");
+  if (nitEarlyBootstrapPublish(uniqueId, session->wire.rank, session->wire.nranks, "MRC",
+        session->handle.stage.comm, session->recv, session) != 0)
+    return earlyMrcInvalid("duplicate or invalid communicator handoff");
+  session->bound = true;
+  return ncclSuccess;
+}
+
+extern "C" int ncclMrcEarlyBootstrapCloseV1(void* opaque, int requireConsumed) {
+  auto* session = static_cast<EarlyMrcSession*>(opaque);
+  if (!session) return ncclSuccess;
+  int consumed = 0;
+  if (session->bound && nitEarlyBootstrapWithdraw(session, &consumed) != 0)
+    return earlyMrcInvalid("lost ownership of communicator handoff");
+  if (session->senderPending) {
+    NitIbConnectPoll profile(reinterpret_cast<uintptr_t>(&session->handle), session->dev);
+    profile.phase(NitIbPhase::Cleanup);
+    profile.finish(ncclRemoteError, false);
+  }
+  ncclResult_t ret = ncclSuccess;
+  if (!consumed) {
+    ret = ncclIbCloseSend(session->handle.stage.comm);
+    ncclResult_t recvRet = ncclIbCloseRecv(session->recv);
+    if (ret == ncclSuccess) ret = recvRet;
+  }
+  free(session->handle.stage.buffer);
+  if (session->ctx && ret == ncclSuccess) ret = ncclIbFinalize(session->ctx);
+  free(session);
+  if (ret != ncclSuccess) return ret;
+  if (requireConsumed && !consumed) return earlyMrcInvalid("NCCL did not adopt the prepared connections");
   return ncclSuccess;
 }

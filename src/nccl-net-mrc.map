@@ -1,6 +1,7 @@
 {
   global:
     ncclNetPlugin_v12;
+    ncclMrcEarlyBootstrap*V1;
   local:
     *;
 };

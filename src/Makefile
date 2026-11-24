@@ -24,6 +24,11 @@ CPPFLAGS += -I. -Iinclude -Iinclude/plugin -I$(MRC_HOME)/include
 CPPFLAGS += -I$(CUDA_HOME)/include -I$(CUDA_HOME)/include/cccl
 CPPFLAGS += -DNCCL_OS_LINUX -DNCCL_BUILD_RDMA_CORE -DNCCL_COMM_H_ -DncclNetIb=ncclNetPlugin_v12
 CXXFLAGS ?= -O3 -g -fPIC -Wall -Wno-unused-function -Wno-sign-compare -Wvla -std=c++17
+INIT_TRACE_DIR ?= $(abspath ../support)
+INIT_TRACE_LIBDIR ?= $(abspath $(dir $(OUTPUT)))
+CPPFLAGS += -I$(INIT_TRACE_DIR)/src
+LDFLAGS += -L$(INIT_TRACE_LIBDIR) -Wl,-rpath,'$$ORIGIN'
+LDLIBS += -lnccl-init-trace
 ifneq ($(DEBUG),0)
 CXXFLAGS := $(filter-out -O3,$(CXXFLAGS)) -O0 -ggdb3
 endif
@@ -42,12 +47,20 @@ SRCS := $(MISC_SRCS) $(wildcard os/*.cc) $(wildcard transport/*.cc) $(wildcard t
 OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 GIT_VERSION_FILE := $(OBJDIR)/include/nccl_git_version.h
+TRACE_LIBRARY := $(INIT_TRACE_LIBDIR)/libnccl-init-trace.so
+TRACE_SOURCES := $(addprefix $(INIT_TRACE_DIR)/src/,init_trace.cc allgather_profile.cc ib_connect_profile.cc early_bootstrap.cc)
+TRACE_HEADERS := $(wildcard $(INIT_TRACE_DIR)/src/*.h)
 
 all: $(OUTPUT)
 
-$(OUTPUT): $(OBJS) nccl-net-mrc.map Makefile
+$(OUTPUT): $(OBJS) nccl-net-mrc.map Makefile $(TRACE_LIBRARY)
 	@printf "Linking    %-35s > %s\n" $(notdir $@) $@
 	$(CXX) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+$(TRACE_LIBRARY): $(TRACE_SOURCES) $(TRACE_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -g -fPIC -shared -pthread -Wall -Wextra -Werror \
+	    -Wl,-soname,libnccl-init-trace.so $(TRACE_SOURCES) -o $@
 
 $(OBJDIR)/misc/git_version.o $(OBJDIR)/transport/net_ib/init.o: $(GIT_VERSION_FILE)
 
@@ -62,6 +75,7 @@ $(OBJDIR)/%.o: %.cc
 
 clean:
 	rm -rf $(OBJDIR) $(OUTPUT)
+	$(RM) $(TRACE_LIBRARY)
 
 FORCE:
 

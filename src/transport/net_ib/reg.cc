@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "common.h"
+#include "allgather_profile.h"
 
 ncclResult_t ncclIbRegMrDmaBufInternal2(ncclIbNetCommDevBase* base, void* data, size_t size, int type, uint64_t offset,
                                         int fd, uint64_t mrFlags, ibv_mr** mhandle) {
@@ -14,9 +15,13 @@ ncclResult_t ncclIbRegMrDmaBufInternal2(ncclIbNetCommDevBase* base, void* data, 
   struct ncclIbMrCache* cache = &ncclIbDevs[base->ibDevN].mrCache;
   uintptr_t addr = (uintptr_t)data & -pageSize;
   size_t pages = ((uintptr_t)data + size - addr + pageSize - 1) / pageSize;
+  NitAgMemory* profile = nit_ag_memory;
+  uint64_t lockStart = profile ? nit_ag_now() : 0;
   std::lock_guard<std::mutex> lock(ncclIbDevs[base->ibDevN].mutex);
+  if (profile) profile->cache_lock_ns += nit_ag_now() - lockStart;
   for (int slot = 0; /*true*/; slot++) {
     if (slot == cache->population || addr < cache->slots[slot].addr) {
+      if (profile) ++profile->cache_misses;
       // didn't find in cache
       if (cache->population == cache->capacity) {
         // must grow cache
@@ -59,6 +64,7 @@ ncclResult_t ncclIbRegMrDmaBufInternal2(ncclIbNetCommDevBase* base, void* data, 
       return ncclSuccess;
     } else if ((addr >= cache->slots[slot].addr) &&
                ((addr - cache->slots[slot].addr) / pageSize + pages) <= cache->slots[slot].pages) {
+      if (profile) ++profile->cache_hits;
       cache->slots[slot].refs += 1;
       *mhandle = cache->slots[slot].mr;
       return ncclSuccess;
@@ -101,7 +107,10 @@ ncclResult_t ncclIbRegMr(void* comm, void* data, size_t size, int type, void** m
 
 ncclResult_t ncclIbDeregMrInternal(ncclIbNetCommDevBase* base, ibv_mr* mhandle) {
   struct ncclIbMrCache* cache = &ncclIbDevs[base->ibDevN].mrCache;
+  NitAgMemory* profile = nit_ag_memory;
+  uint64_t lockStart = profile ? nit_ag_now() : 0;
   std::lock_guard<std::mutex> lock(ncclIbDevs[base->ibDevN].mutex);
+  if (profile) profile->cache_lock_ns += nit_ag_now() - lockStart;
   for (int i = 0; i < cache->population; i++) {
     if (mhandle == cache->slots[i].mr) {
       if (0 == --cache->slots[i].refs) {

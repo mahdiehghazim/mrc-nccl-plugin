@@ -9,6 +9,9 @@
  *************************************************************************/
 
 #include "ibvwrap.h"
+#include "init_trace.h"
+#include "allgather_profile.h"
+#include "ib_connect_profile.h"
 #include <sys/types.h>
 #include <unistd.h>
 #include <chrono>
@@ -101,6 +104,7 @@ ncclResult_t wrap_ibv_symbols(void) {
 NCCL_PARAM(IbMQpRetryAll, "IB_MQP_RETRY_ALL", 0);
 NCCL_PARAM(IbMQpRetryCnt, "IB_MQP_RETRY_CNT", 34);
 NCCL_PARAM(IbMQpRetryTimeout, "IB_MQP_RETRY_SLEEP_MSEC", 100); // in milliseconds
+NCCL_PARAM(MrcQpCreationTiming, "MRC_QP_CREATION_TIMING", 0);
 
 #define IBV_ERR_EQ(e, code) (e == code || e == (-code))
 #define IBV_MQP_RETRY_ERRNO(e) (IBV_ERR_EQ(e, ETIMEDOUT))
@@ -262,7 +266,25 @@ ncclResult_t wrap_mrc_destroy_qp_hint(struct mrc_qp_hint* hint) {
 
 ncclResult_t wrap_mrc_create_qp(struct mrc_qp** ret, struct mrc_context* mrcContext,
                                 struct mrc_qp_init_attr* qpInitAttr) {
-  *ret = mrc_create_qp(mrcContext, qpInitAttr);
+  const bool timing = ncclParamMrcQpCreationTiming() != 0;
+  const auto start = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  {
+    NitScope traceQp("provider.mrc_create_qp");
+    NitIbConnectOperation profileQp(NitIbOp::ProviderCreateQp);
+    *ret = mrc_create_qp(mrcContext, qpInitAttr);
+    const int result = *ret ? 0 : (errno ? errno : EIO);
+    traceQp.result(result);
+    profileQp.result(result);
+  }
+  if (timing) {
+    const int savedErrno = errno;
+    const double durationUs = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - start).count();
+    INFO(NCCL_NET, "NET/MRC: mrc_qp_creation duration_us=%.3f context=%p qp=%p status=%s errno=%d",
+         durationUs, static_cast<void*>(mrcContext), static_cast<void*>(*ret),
+         *ret ? "success" : "failure", *ret ? 0 : savedErrno);
+    errno = savedErrno;
+  }
   if (*ret == NULL) {
     WARN("NET/IB : mrc_create_qp failed with error %s", strerror(errno));
     return ncclSystemError;
@@ -272,7 +294,21 @@ ncclResult_t wrap_mrc_create_qp(struct mrc_qp** ret, struct mrc_context* mrcCont
 
 ncclResult_t wrap_mrc_modify_qp(struct mrc_qp* qp, struct ibv_qp_attr* attr, int attrMask,
                                 struct mrc_qp_attr* mrcAttr, int mrcAttrMask) {
-  int ret = mrc_modify_qp(qp, attr, attrMask, mrcAttr, mrcAttrMask);
+  const char* traceName = !(attrMask & IBV_QP_STATE) ? "provider.mrc_modify_qp.other" :
+      attr->qp_state == IBV_QPS_INIT ? "provider.mrc_modify_qp.INIT" :
+      attr->qp_state == IBV_QPS_RTR ? "provider.mrc_modify_qp.RTR" :
+      attr->qp_state == IBV_QPS_RTS ? "provider.mrc_modify_qp.RTS" :
+      "provider.mrc_modify_qp.other_state";
+  NitIbOp operation = !(attrMask & IBV_QP_STATE) ? NitIbOp::ProviderModifyOther :
+      attr->qp_state == IBV_QPS_INIT ? NitIbOp::ProviderModifyInit :
+      attr->qp_state == IBV_QPS_RTR ? NitIbOp::ProviderModifyRtr :
+      attr->qp_state == IBV_QPS_RTS ? NitIbOp::ProviderModifyRts : NitIbOp::ProviderModifyOther;
+  int ret = NIT_CALL(traceName, ([&]() {
+    NitIbConnectOperation profileQp(operation);
+    int result = mrc_modify_qp(qp, attr, attrMask, mrcAttr, mrcAttrMask);
+    profileQp.result(result);
+    return result;
+  })());
   if (ret != 0) {
     WARN("NET/IB : mrc_modify_qp failed with error %d", ret);
     return ncclSystemError;
@@ -318,6 +354,11 @@ ncclResult_t wrap_mrc_post_recv(struct mrc_qp* qp, struct ibv_recv_wr* wr, struc
 
 ncclResult_t wrap_mrc_poll_cq(struct mrc_cq* cq, int numEntries, struct ibv_wc* wc, int* numDone) {
   int done = mrc_poll_cq(cq, numEntries, wc);
+  if (nit_ag_step) {
+    ++nit_ag_step->cq_calls;
+    if (done == 0) ++nit_ag_step->cq_empty;
+    if (done > 0) nit_ag_step->cq_entries += done;
+  }
   if (done < 0) {
     WARN("NET/IB : mrc_poll_cq failed with error %d", done);
     return ncclSystemError;
@@ -336,6 +377,7 @@ ncclResult_t wrap_ibv_dealloc_pd(
 }
 
 ncclResult_t wrap_ibv_reg_mr(struct ibv_mr** ret, struct ibv_pd* pd, void* addr, size_t length, int access) {
+  NitAgProviderMemoryScope profile(false, length);
   IBV_PTR_CHECK_ERRNO(ibvSymbols, ibv_internal_reg_mr, ibv_internal_reg_mr(pd, addr, length, access), *ret, NULL,
                       "ibv_reg_mr");
 }
@@ -350,6 +392,7 @@ struct ibv_mr* wrap_direct_ibv_reg_mr(struct ibv_pd* pd, void* addr, size_t leng
 
 ncclResult_t wrap_ibv_reg_mr_iova2(struct ibv_mr** ret, struct ibv_pd* pd, void* addr, size_t length, uint64_t iova,
                                    int access) {
+  NitAgProviderMemoryScope profile(false, length);
   if (ibvSymbols.ibv_internal_reg_mr_iova2 == NULL) {
     return ncclInternalError;
   }
@@ -377,6 +420,7 @@ struct ibv_mr* wrap_direct_ibv_reg_dmabuf_mr(struct ibv_pd* pd, uint64_t offset,
 
 ncclResult_t wrap_ibv_dereg_mr(
   struct ibv_mr* mr) { /*returns 0 on success, or the value of errno on failure (which indicates the failure reason)*/
+  NitAgProviderMemoryScope profile(true);
   IBV_INT_CHECK_RET_ERRNO(ibvSymbols, ibv_internal_dereg_mr, ibv_internal_dereg_mr(mr), 0, "ibv_dereg_mr");
 }
 

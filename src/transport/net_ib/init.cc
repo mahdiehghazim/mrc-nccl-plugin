@@ -292,7 +292,11 @@ ncclResult_t ncclIbFinalizeDevices(void) {
 extern int64_t ncclIbArThreshold;
 ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
-  if (netRefCount++) return ret;
+  if (netRefCount++) {
+    // Early host preparation has no NCCL profiler callback yet.
+    if (profFunction) ncclProfilerFunction = profFunction;
+    return ret;
+  }
   ncclProfilerFunction = profFunction;
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
